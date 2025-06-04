@@ -1,5 +1,5 @@
 GCC_PREFIX = riscv32-unknown-elf
-ABI = -march=rv32gcv_zbb_zbs -mabi=ilp32f
+ABI = -march=rv32gcv_zbb_zbs -mabi=ilp32f -O2 -mcmodel=medany
 LINK = ./veer/link.ld
 CODEFOLDER = ./assembly
 TEMPPATH = ./veer/tempFiles
