@@ -1,73 +1,243 @@
-.section .text
-.global fft_stage_vectorized
-fft_stage_vectorized:
-    # a0 = base address of matrix (interleaved complex)
-    # a1 = stage size (s0)
-    # a2 = FFT length N
-    # a3 = address of twiddle_re
-    # a4 = address of twiddle_im
+#define STDOUT 0xd0580000
 
-    # Constants
-    slli t0, a1, 1              # t0 = stage_size = 2 * s0
-    li t1, 0                    # block base index
+.section .data
 
-stage_block_loop:
-    bge t1, a2, stage_done      # if block_start >= N, done
+real:           .float 1.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0, 0.0
+imag:           .float 0.0, 1.0, 0.0, -1.0, 0.0, -1.0, 0.0, 1.0
+twiddle_real:   .float 1.0,  0.7071,  0.0, -0.7071,  -1.0, -0.7071,  0.0,  0.7071
+twiddle_imag:   .float 0.0, -0.7071, -1.0, -0.7071,   0.0,  0.7071,  1.0,  0.7071
+bitrev_indices: .space 32          # 8 words (for n = 8)
 
-    li t2, 0                    # within-block offset k
-stage_inner_loop:
-    bge t2, a1, next_block      # if k >= s0, move to next block
+filename_vl_debug:   .string "vl_output.hex"
+.byte 0,0               # pad to 16 bytes
 
-    # index = block_base + k
-    add t3, t1, t2
-    slli t4, t3, 3              # offset in bytes (8 bytes per complex)
-    add t5, a0, t4              # addr1 = &x[k]
+.align 4
+vl_debug_value:   .word 0xA5A5A5A5
 
-    # index2 = index + s0
-    add t6, t3, a1
-    slli t7, t6, 3
-    add t8, a0, t7              # addr2 = &x[k + s0]
+.align 4
+filename_rev_real0: .string "rev_real0_output.hex"
+.byte 0,0,0            # pad to 24 bytes
 
-    # Load x[k] and x[k+s0] as vectors (Re, Im pairs)
-    vsetvli t9, zero, e32, m1
-    vle32.v v0, (t5)            # v0 = [Re_even, Im_even]
-    vle32.v v1, (t8)            # v1 = [Re_odd, Im_odd]
+.align 4
+filename_real:    .string "output_real.hex"
+.byte 0,0,0           # pad to 20 bytes
 
-    # Load twiddle factor for this k
-    mul t10, t2, 4              # offset = 4 * k
-    add t11, a3, t10
-    flw f0, 0(t11)              # f0 = cos
-    add t11, a4, t10
-    flw f1, 0(t11)              # f1 = -sin
+.align 4
+filename_imag:    .string "output_imag.hex"
+.byte 0,0,0           # pad to 20 bytes
 
-    # Compute: temp = v1 * twiddle (complex multiply)
-    # temp_re = Re*v0 - Im*v1
-    # temp_im = Re*v1 + Im*v0
+.section .text.init
+.globl _start
 
-    vmv.v.x v2, f0              # v2 = [cos, cos]
-    vmv.v.x v3, f1              # v3 = [-sin, -sin]
+_start:
+    li   s11, 8              # n = 8
 
-    vmul.vv v4, v1, v2          # v4 = v1 * cos
-    vmul.vv v5, v1, v3          # v5 = v1 * -sin
+    # Step 1: Compute bit-reversal indices
+    la   a2, bitrev_indices
+    li   t0, 0
+bitrev_loop:
+    mv   t3, t0
+    li   t2, 0
+    li   t6, 3             # number of bits = 3
+reverse_bits:
+    slli t2, t2, 1
+    andi t5, t3, 1
+    or   t2, t2, t5
+    srli t3, t3, 1
+    addi t6, t6, -1
+    bnez t6, reverse_bits
+    sw   t2, 0(a2)
+    addi t0, t0, 1
+    addi a2, a2, 4
+    blt  t0, s11, bitrev_loop
 
-    vslideup.vi v6, v1, 1       # shift to align real/imag for complex ops
-    vmul.vv v6, v6, v3          # v6 = Re*sin or Im*sin
-    vmul.vv v7, v6, v2          # v7 = Re*cos or Im*cos
+    # Step 2: Bit-reversal permutation (in-place swap)
+    la   t0, real
+    la   t1, imag
+    la   t2, bitrev_indices
+    li   t3, 0                # i = 0
+bitrev_perm_loop:
+    bge  t3, s11, end_bitrev  # i >= n? done
+    slli t4, t3, 2            # byte offset for i
+    add  t5, t2, t4
+    lw   t5, 0(t5)            # j = bitrev_indices[i]
+    bge  t3, t5, next_i       # skip if i >= j
+    slli t6, t5, 2            # byte offset for j
+    # Swap real[i] and real[j]
+    add  a0, t0, t4
+    add  a1, t0, t6
+    flw  ft0, 0(a0)
+    flw  ft1, 0(a1)
+    fsw  ft0, 0(a1)
+    fsw  ft1, 0(a0)
+    # Swap imag[i] and imag[j]
+    add  a0, t1, t4
+    add  a1, t1, t6
+    flw  ft0, 0(a0)
+    flw  ft1, 0(a1)
+    fsw  ft0, 0(a1)
+    fsw  ft1, 0(a0)
+next_i:
+    addi t3, t3, 1
+    j    bitrev_perm_loop
+end_bitrev:
+    # Step 3: Vector configuration
+    li   t0, 1                # Vector length = 1
+    vsetvli zero, t0, e32, m1, ta, ma
 
-    # Do fused multiply/add/subtract if supported
-    # Add/sub with original even vector
-    vadd.vv v8, v0, v4          # out1 = even + temp
-    vsub.vv v9, v0, v4          # out2 = even - temp
+    # Step 4: FFT stages with bounds checking
+    li   s0, 1                # stage = 1
+    la   a0, real
+    la   a1, imag
+    la   a2, twiddle_real
+    la   a3, twiddle_imag
 
-    vse32.v v8, (t5)            # store x[k]
-    vse32.v v9, (t8)            # store x[k+s0]
+fft_stage_loop:
+    li   t0, 8                # N = 8
+    li   t6, 3                # log2(N) = 3
+    bgt  s0, t6, next_stage   # Skip if stage > log2(N)
+    
+    sll  s1, s0, 1            # m = 2^stage
+    bgt  s1, t0, next_stage   # Skip if m > N
+    
+    srli s2, s1, 1            # half_m = m/2
+    div  s3, t0, s1           # stride = N/m
+    li   s4, 0                # i = 0
 
-    addi t2, t2, 1
-    j stage_inner_loop
+fft_i_loop:
+    bge  s4, t0, next_stage   
+    li   s5, 0                # j = 0
 
-next_block:
-    add t1, t1, t0              # block += 2*s0
-    j stage_block_loop
+fft_j_loop:
+    bge  s5, s2, fft_i_inc    
+    
+    # Calculate indices with bounds checking
+    add  t1, s4, s5           # i+j
+    bge  t1, s11, fft_j_inc   
+    
+    add  t2, t1, s2           # i+j+half_m
+    bge  t2, s11, fft_j_inc   
+    
+    slli t3, t1, 2            # byte offset top
+    slli t4, t2, 2            # byte offset bottom
 
-stage_done:
+    # Load elements using vector loads
+    add  t5, a0, t3
+    vle32.v v0, (t5)          # real[i+j]
+    add  t5, a1, t3
+    vle32.v v1, (t5)          # imag[i+j]
+
+    add  t5, a0, t4
+    vle32.v v2, (t5)          # real[i+j+half_m]
+    add  t5, a1, t4
+    vle32.v v3, (t5)          # imag[i+j+half_m]
+
+    # Load twiddle with bounds check
+    mul  t5, s5, s3           
+    bge  t5, s11, fft_j_inc   
+    slli t5, t5, 2            
+    add  t6, a2, t5
+    vle32.v v4, (t6)          # W_real
+    add  t6, a3, t5
+    vle32.v v5, (t6)          # W_imag
+
+    # Store to temp scalar registers
+    vfmv.f.s ft0, v0          # real_t
+    vfmv.f.s ft1, v1          # imag_t
+    vfmv.f.s ft2, v2          # real_b
+    vfmv.f.s ft3, v3          # imag_b
+    vfmv.f.s ft4, v4          # W_real
+    vfmv.f.s ft5, v5          # W_imag
+
+    # Butterfly computation in scalar
+    fmul.s ft6, ft2, ft4      # real_b * W_real
+    fmul.s ft7, ft3, ft5      # imag_b * W_imag
+    fsub.s ft8, ft6, ft7      # temp_real
+    fmul.s ft6, ft2, ft5      # real_b * W_imag
+    fmul.s ft7, ft3, ft4      # imag_b * W_real
+    fadd.s ft9, ft6, ft7      # temp_imag
+
+    # Move results back to vector registers
+    fsub.s ft10, ft0, ft8     # real_b_new
+    vfmv.s.f v12, ft10
+    add  t5, a0, t4
+    vse32.v v12, (t5)
+
+    fsub.s ft11, ft1, ft9     # imag_b_new
+    vfmv.s.f v13, ft11
+    add  t5, a1, t4
+    vse32.v v13, (t5)
+
+    fadd.s ft10, ft0, ft8     # real_t_new
+    vfmv.s.f v10, ft10
+    add  t5, a0, t3
+    vse32.v v10, (t5)
+
+    fadd.s ft11, ft1, ft9     # imag_t_new
+    vfmv.s.f v11, ft11
+    add  t5, a1, t3
+    vse32.v v11, (t5)
+
+fft_j_inc:
+    addi s5, s5, 1            
+    j    fft_j_loop
+
+fft_i_inc:
+    add  s4, s4, s1           
+    j    fft_i_loop
+
+next_stage:
+    addi s0, s0, 1            
+    ble  s0, t6, fft_stage_loop
+
+    # Step 5: Write output files
+    la   a0, filename_real
+    la   a1, real
+    li   a2, 32               # 8 floats * 4 bytes
+    call write_to_file
+
+    la   a0, filename_imag
+    la   a1, imag
+    li   a2, 32
+    call write_to_file
+
+    j    _finish
+
+write_to_file:
+    # Instead of file operations, write directly to memory
+    addi sp, sp, -16
+    sw   ra, 12(sp)
+    sw   s0, 8(sp)
+    sw   s1, 4(sp)
+    sw   s2, 0(sp)
+
+    mv   s0, a0    # Save output address
+    mv   s1, a1    # Save data address
+    mv   s2, a2    # Save size
+
+    # Direct memory copy loop
+    mv   t0, zero  # Initialize counter
+copy_loop:
+    bge  t0, s2, copy_done
+    add  t1, s1, t0          # Source address
+    flw  ft0, 0(t1)          # Load float
+    add  t2, s0, t0          # Destination address
+    fsw  ft0, 0(t2)          # Store float
+    addi t0, t0, 4           # Increment by float size
+    j    copy_loop
+
+copy_done:
+    lw   ra, 12(sp)
+    lw   s0, 8(sp)
+    lw   s1, 4(sp)
+    lw   s2, 0(sp)
+    addi sp, sp, 16
     ret
+
+_finish:
+    lui  t0, 0xd0580          # STDOUT address
+    li   t1, 3                # Success code
+    sb   t1, 0(t0)            # Write to STDOUT
+
+_final_halt_loop:
+    j    _final_halt_loop
